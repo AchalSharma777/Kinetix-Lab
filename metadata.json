@@ -1,0 +1,6 @@
+{
+  "name": "Kinetix Lab — Robotics & Drone Engineering Workbench",
+  "description": "Engineering workbench for robotics and autonomous drone projects featuring Git-style and empirical performance tracking, failure root-cause logs, microcontroller code libraries, mechatronics build guides, and Qualcomm AI Hub NPU optimization telemetry.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
