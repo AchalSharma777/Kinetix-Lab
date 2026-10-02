@@ -10,6 +10,9 @@ dotenv.config();
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+// In-memory cache timestamp to prevent repetitive 429 SDK retry delays when search quota is exhausted
+let searchQuotaExhaustedUntil = 0;
+
 async function startServer() {
   const app = express();
   const PORT = 3000;
@@ -37,46 +40,123 @@ async function startServer() {
 
       const {
         messages = [],
-        mode = 'balanced',
-        useSearchGrounding = true,
+        mode = 'general',
+        useSearchGrounding = false,
         projectContext = '',
       } = req.body;
 
-      // Select model according to mode
-      const selectedModel =
-        mode === 'fast' ? 'gemini-3.1-flash-lite' : 'gemini-3.8-flash';
+      // Model selection per user specification:
+      // gemini-3.5-flash for general tasks & Google Search Grounding
+      // gemini-3.1-flash-lite for fast tasks
+      const targetModel =
+        mode === 'fast' ? 'gemini-3.1-flash-lite' : 'gemini-3.5-flash';
 
       const systemInstruction = `You are the Kinetix Lab Principal Robotics & Autonomous UAV Control Engineer.
-Your role is to help the engineer debug robotics and drone failures, tune PID/MPC/SO(3)/EKF control loops, write deterministic zero-heap C++17 microcontroller code (STM32H7, Teensy 4.1, ESP32-S3, RP2040), design mechatronics hardware pinouts, and optimize edge models on Qualcomm AI Hub (Dragonwing RB3 Gen 2, RB5, Snapdragon Flight Hexagon NPU).
-Keep answers concise, technically rigorous, and grounded in real datasheets, control theory equations, and embedded firmware best practices.
+Your role is to assist engineers with:
+1. Debugging robotics and UAV telemetry regressions, motor desyncs, gyro resonance, and frame oscillations.
+2. Deriving and tuning PID, MPC, SO(3) geometric attitude, and 15-state ES-EKF sensor fusion algorithms.
+3. Writing zero-heap, deterministic C++17 microcontroller drivers and register mappings for STM32H7, STM32F4, Teensy 4.1, ESP32-S3, and RP2040.
+4. Designing mechatronics hardware, BOM selection, isolated CAN-FD bus routing, and pre-power smoke tests.
+5. Optimizing edge AI perception/depth models with Qualcomm AI Hub (Dragonwing RB3 Gen 2, RB5, Snapdragon Flight QRB5165 Hexagon NPU).
+
+Format mathematical equations clearly and provide production-ready C++/Python code snippets where relevant.
 
 Active Workbench Context:
 ${projectContext}`;
 
-      const contents = messages.map(
-        (m: { role: 'user' | 'model'; text: string }) => ({
-          role: m.role,
-          parts: [{ text: m.text }],
-        })
-      );
+      // Build and sanitize multi-turn contents ensuring strict alternating user/model turns
+      const rawList = Array.isArray(messages) ? messages : [];
+      const sanitizedContents: { role: 'user' | 'model'; parts: { text: string }[] }[] = [];
 
-      const config: Record<string, unknown> = {
-        systemInstruction,
-      };
+      for (const m of rawList) {
+        if (!m || typeof m.text !== 'string' || !m.text.trim()) continue;
+        const role = m.role === 'model' ? 'model' : 'user';
 
-      if (useSearchGrounding && selectedModel === 'gemini-3.8-flash') {
-        config.tools = [{ googleSearch: {} }];
+        // Gemini multi-turn conversation must begin with a 'user' turn
+        if (sanitizedContents.length === 0 && role !== 'user') continue;
+
+        const lastItem = sanitizedContents[sanitizedContents.length - 1];
+        if (lastItem && lastItem.role === role) {
+          lastItem.parts.push({ text: m.text.trim() });
+        } else {
+          sanitizedContents.push({ role, parts: [{ text: m.text.trim() }] });
+        }
       }
 
-      const response = await ai.models.generateContent({
-        model: selectedModel,
-        contents,
-        config,
-      });
+      // If no valid user input was parsed, fallback to a default prompt
+      if (sanitizedContents.length === 0) {
+        sanitizedContents.push({
+          role: 'user',
+          parts: [{ text: 'Provide a summary of the active robotics and drone projects.' }],
+        });
+      }
 
-      const replyText = response.text || 'No response generated.';
+      let response;
+      let usedSearch = false;
+      let searchFallbackNotice: string | null = null;
+      let finalModel = targetModel;
+
+      const shouldAttemptSearch =
+        useSearchGrounding && Date.now() > searchQuotaExhaustedUntil;
+
+      // If Search Grounding is requested and not in rate-limit cooldown
+      if (shouldAttemptSearch) {
+        try {
+          response = await ai.models.generateContent({
+            model: 'gemini-3.5-flash',
+            contents: sanitizedContents,
+            config: {
+              systemInstruction,
+              tools: [{ googleSearch: {} }],
+            },
+          });
+          usedSearch = true;
+          finalModel = 'gemini-3.5-flash';
+        } catch (searchErr: unknown) {
+          const searchErrMsg =
+            searchErr instanceof Error ? searchErr.message : String(searchErr);
+          console.warn('Google Search Grounding call failed, falling back to standard model:', searchErrMsg);
+
+          // If quota exhausted on search tool, set a 60s cooldown to prevent slow repeat timeouts
+          if (searchErrMsg.includes('429') || searchErrMsg.includes('RESOURCE_EXHAUSTED')) {
+            searchQuotaExhaustedUntil = Date.now() + 60_000;
+          }
+
+          searchFallbackNotice =
+            'Search Grounding quota exceeded on current API tier; response generated via Gemini 3.5 Flash engineering knowledge base.';
+        }
+      } else if (useSearchGrounding && Date.now() <= searchQuotaExhaustedUntil) {
+        searchFallbackNotice =
+          'Search Grounding in cooldown due to API tier quota; response generated via Gemini 3.5 Flash knowledge base.';
+      }
+
+      // Standard generation fallback (without search tools)
+      if (!response) {
+        try {
+          response = await ai.models.generateContent({
+            model: targetModel,
+            contents: sanitizedContents,
+            config: {
+              systemInstruction,
+            },
+          });
+          finalModel = targetModel;
+        } catch (primaryErr: unknown) {
+          console.warn(`Primary model ${targetModel} failed, trying fallback model gemini-3.1-flash-lite:`, primaryErr);
+          response = await ai.models.generateContent({
+            model: 'gemini-3.1-flash-lite',
+            contents: sanitizedContents,
+            config: {
+              systemInstruction,
+            },
+          });
+          finalModel = 'gemini-3.1-flash-lite';
+        }
+      }
+
+      const replyText = response?.text || 'No response generated.';
       const rawChunks =
-        response.candidates?.[0]?.groundingMetadata?.groundingChunks || [];
+        response?.candidates?.[0]?.groundingMetadata?.groundingChunks || [];
 
       const sources = rawChunks
         .map((c: { web?: { uri?: string; title?: string } }) =>
@@ -91,13 +171,15 @@ ${projectContext}`;
 
       return res.json({
         text: replyText,
-        modelUsed: selectedModel,
+        modelUsed: finalModel,
+        usedSearch,
         sources,
+        searchFallbackNotice,
       });
     } catch (err: unknown) {
       const errorMessage =
         err instanceof Error ? err.message : 'Unexpected Gemini API error';
-      console.error('Gemini API error:', errorMessage);
+      console.error('Gemini API error in /api/engineering-chat:', errorMessage);
       return res.status(500).json({
         error: errorMessage,
       });
